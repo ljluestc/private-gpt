@@ -1,14 +1,16 @@
 import logging
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, AnyStr, BinaryIO
+from typing import TYPE_CHECKING, Any, AnyStr, BinaryIO
 
 from injector import inject, singleton
 from llama_index.core.node_parser import SentenceWindowNodeParser
+from llama_index.core.schema import BaseNode
 from llama_index.core.storage import StorageContext
 
 from private_gpt.components.embedding.embedding_component import EmbeddingComponent
 from private_gpt.components.ingest.ingest_component import get_ingestion_component
+from private_gpt.components.ingest.ingest_helper import CODE_EXTENSIONS
 from private_gpt.components.llm.llm_component import LLMComponent
 from private_gpt.components.node_store.node_store_component import NodeStoreComponent
 from private_gpt.components.vector_store.vector_store_component import (
@@ -21,6 +23,84 @@ if TYPE_CHECKING:
     from llama_index.core.storage.docstore.types import RefDocInfo
 
 logger = logging.getLogger(__name__)
+
+
+class CodeAwareNodeParser:
+    """A node parser that routes code files to a code-aware splitter.
+
+    Documents whose ``file_name`` metadata ends with a recognised source-code
+    extension are split using ``CodeSplitter`` (tree-sitter based), which
+    respects function / class boundaries.  All other documents fall through to
+    the default ``SentenceWindowNodeParser``.
+    """
+
+    def __init__(self, chunk_lines: int = 40, chunk_lines_overlap: int = 15) -> None:
+        self._chunk_lines = chunk_lines
+        self._chunk_lines_overlap = chunk_lines_overlap
+        self._sentence_parser = SentenceWindowNodeParser.from_defaults()
+
+    def __call__(self, nodes: list[BaseNode], **kwargs: Any) -> list[BaseNode]:
+        code_nodes: list[BaseNode] = []
+        text_nodes: list[BaseNode] = []
+
+        for node in nodes:
+            file_name = node.metadata.get("file_name", "")
+            ext = Path(file_name).suffix.lower() if file_name else ""
+            if ext in CODE_EXTENSIONS:
+                code_nodes.append(node)
+            else:
+                text_nodes.append(node)
+
+        result: list[BaseNode] = []
+
+        # Process code documents with CodeSplitter
+        if code_nodes:
+            try:
+                from llama_index.core.node_parser import CodeSplitter
+
+                code_splitter = CodeSplitter(
+                    language=CODE_EXTENSIONS.get(
+                        Path(code_nodes[0].metadata.get("file_name", "")).suffix.lower(),
+                        "python",
+                    ),
+                    chunk_lines=self._chunk_lines,
+                    chunk_lines_overlap=self._chunk_lines_overlap,
+                )
+                # Group code nodes by language to use the right splitter per group
+                by_language: dict[str, list[BaseNode]] = {}
+                for n in code_nodes:
+                    fn = n.metadata.get("file_name", "")
+                    ext = Path(fn).suffix.lower() if fn else ""
+                    lang = CODE_EXTENSIONS.get(ext, "python")
+                    by_language.setdefault(lang, []).append(n)
+
+                for lang, lang_nodes in by_language.items():
+                    try:
+                        splitter = CodeSplitter(
+                            language=lang,
+                            chunk_lines=self._chunk_lines,
+                            chunk_lines_overlap=self._chunk_lines_overlap,
+                        )
+                        result.extend(splitter(lang_nodes))
+                    except Exception:
+                        # If CodeSplitter fails for a language (e.g. missing
+                        # tree-sitter grammar), fall back to sentence parser.
+                        logger.warning(
+                            "CodeSplitter failed for language=%s, falling back to sentence parser",
+                            lang,
+                        )
+                        result.extend(self._sentence_parser(lang_nodes))
+            except ImportError:
+                logger.warning(
+                    "CodeSplitter not available, falling back to sentence parser for code files"
+                )
+                result.extend(self._sentence_parser(code_nodes))
+
+        # Process non-code documents with the sentence-window parser
+        if text_nodes:
+            result.extend(self._sentence_parser(text_nodes))
+
+        return result
 
 
 @singleton
@@ -39,7 +119,7 @@ class IngestService:
             docstore=node_store_component.doc_store,
             index_store=node_store_component.index_store,
         )
-        node_parser = SentenceWindowNodeParser.from_defaults()
+        node_parser = CodeAwareNodeParser()
 
         self.ingest_component = get_ingestion_component(
             self.storage_context,

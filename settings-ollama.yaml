@@ -4,11 +4,19 @@ server:
 llm:
   mode: ollama
   max_new_tokens: 512
-  context_window: 3900
+  context_window: 8192
+  prompt_style: "llama3"
   temperature: 0.1     #The temperature of the model. Increasing the temperature will make the model answer more creatively. A value of 0.1 would be more factual. (Default: 0.1)
 
 embedding:
   mode: ollama
+
+rag:
+  similarity_top_k: 10
+  rerank:
+    enabled: true
+    model: cross-encoder/ms-marco-MiniLM-L-2-v2
+    top_n: 5
 
 ollama:
   llm_model: llama3.1
