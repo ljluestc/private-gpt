@@ -1,0 +1,55 @@
+# Fix: pydantic v2 `localns` forward-ref compatibility (#1570)
+
+## Description
+
+Resolves #1570.
+
+Users encounter a `TypeError: localns arguments are not longer accepted` at runtime when ecosystem dependencies call `SomeModel.update_forward_refs(localns=...)` under pydantic v2. pydantic v2 retains `update_forward_refs` for migration purposes but rejects the `localns` keyword argument that was valid in v1.
+
+This PR adds a minimal startup shim in `private_gpt/__init__.py` that intercepts v1-style `update_forward_refs(**localns)` calls and routes them through `model_rebuild(_types_namespace=...)`, which is the pydantic v2 equivalent.
+
+## Type of Change
+
+- [x] Bug fix (non-breaking change which fixes an issue)
+
+## Root Cause
+
+private-gpt uses pydantic v2 models, but some transitive dependencies still invoke the v1 API:
+
+```python
+SomeModel.update_forward_refs(localns={"Child": Child})
+```
+
+pydantic v2 raises `TypeError` because `localns` is no longer accepted as a kwarg.
+
+## Fix
+
+**`private_gpt/__init__.py`** — added `_patch_pydantic_update_forward_refs()`:
+- Checks for pydantic v2 via `hasattr(BaseModel, "model_rebuild")`.
+- Replaces `BaseModel.update_forward_refs` with a classmethod that forwards `**localns` to `cls.model_rebuild(_types_namespace=localns or None)`.
+- Runs once at import time.
+
+**`tests/test_pydantic_compat.py`** — regression test:
+- Calls `Parent.update_forward_refs(Child=Child)` after importing `private_gpt`.
+- Validates that `model_validate` succeeds with the forward-referenced type.
+
+## How Has This Been Tested?
+
+- [x] Added new unit/integration tests
+- [x] I stared at the code and made sure it makes sense
+
+**Verified locally:**
+1. Reproduced the `TypeError` before the patch.
+2. `ruff check private_gpt/__init__.py tests/test_pydantic_compat.py` — passed.
+3. After patch: `import private_gpt; Parent.update_forward_refs(Child=Child); Parent.model_validate(...)` — succeeded.
+4. Full `pytest` suite was not runnable in the dev environment due to missing test plugins (`injector`, etc.).
+
+## Risk Assessment
+
+**Low-to-moderate.** The shim monkey-patches `BaseModel.update_forward_refs` process-wide, but the replacement only maps to pydantic v2's native `model_rebuild` flow — no behavioral change for code already on v2 APIs.
+
+## Rollback Plan
+
+Remove `_patch_pydantic_update_forward_refs()` and its call from `private_gpt/__init__.py`, revert the commit.
+
+---

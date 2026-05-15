@@ -3,6 +3,8 @@
 import logging
 import os
 
+from pydantic import BaseModel
+
 # Set to 'DEBUG' to have extensive logging turned on, even for libraries
 ROOT_LOG_LEVEL = "INFO"
 
@@ -25,3 +27,18 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
 # adding tiktoken cache path within repo to be able to run in offline environment.
 os.environ["TIKTOKEN_CACHE_DIR"] = "tiktoken_cache"
+
+
+def _patch_pydantic_update_forward_refs() -> None:
+    """Keep compatibility with libraries still using pydantic v1-style localns."""
+    if not hasattr(BaseModel, "model_rebuild"):
+        return
+
+    @classmethod
+    def _compat_update_forward_refs(cls, **localns):
+        return cls.model_rebuild(_types_namespace=localns or None)
+
+    BaseModel.update_forward_refs = _compat_update_forward_refs
+
+
+_patch_pydantic_update_forward_refs()
